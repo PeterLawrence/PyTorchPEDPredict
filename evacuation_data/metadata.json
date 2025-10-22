@@ -1,0 +1,7 @@
+{
+  "num_train_sequences": 50,
+  "num_val_sequences": 10,
+  "room_width": 50,
+  "room_height": 50,
+  "description": "Evacuation simulation data. Values: -1=wall, 0=person, 1=empty space"
+}
