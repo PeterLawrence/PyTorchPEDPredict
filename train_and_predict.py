@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from pathlib import Path
 import json
-
+from evacuation_cnn import EvacuationCNN
 
 class EvacuationDataset(Dataset):
     """Dataset for evacuation sequences"""
@@ -37,46 +37,6 @@ class EvacuationDataset(Dataset):
         input_tensor = input_frames.unsqueeze(1)  # (seq_len, 1, H, W)
         target_tensor = target_frame.unsqueeze(0)  # (1, H, W)
         return input_tensor, target_tensor
-
-
-class EvacuationCNN(nn.Module):
-    """CNN model for predicting next evacuation frame"""
-    def __init__(self, input_frames=5):
-        super(EvacuationCNN, self).__init__()
-        
-        # Process temporal sequence
-        self.temporal_conv = nn.Sequential(
-            nn.Conv2d(input_frames, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-        )
-        
-        # Spatial processing
-        self.spatial_conv = nn.Sequential(
-            nn.Conv2d(64, 128, kernel_size=5, padding=2),
-            nn.ReLU(),
-            nn.Conv2d(128, 64, kernel_size=5, padding=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 1, kernel_size=3, padding=1),
-        )
-    
-    def forward(self, x):
-        # x shape: (batch, seq_len, 1, H, W)
-        batch_size, seq_len, _, H, W = x.shape
-        
-        # Reshape to process all frames together
-        x = x.view(batch_size, seq_len, H, W)
-        
-        # Temporal convolution
-        x = self.temporal_conv(x)
-        
-        # Spatial convolution
-        x = self.spatial_conv(x)
-        
-        return x
 
 
 def train_model(model, train_loader, val_loader, epochs=20, device='cpu'):
@@ -246,7 +206,7 @@ def main():
     
     # Train model
     train_losses, val_losses = train_model(model, train_loader, val_loader, 
-                                           epochs=30, device=device)
+                                           epochs=50, device=device)
     
     # Save model
     torch.save({
