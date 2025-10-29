@@ -122,7 +122,7 @@ class ExitAwareCNN(nn.Module):
 
 class DirectionalLoss(nn.Module):
     """
-    Loss that encourages movement toward exits
+    Loss that encourages movement toward exits and penalizes premature disappearance
     """
     def __init__(self):
         super(DirectionalLoss, self).__init__()
@@ -136,8 +136,34 @@ class DirectionalLoss(nn.Module):
         non_wall = target > -0.5
         target_people = torch.sum((target > -0.5) & (target < 0.5)).float()
         pred_people = torch.sum((pred > -0.5) & (pred < 0.5)).float()
+        prev_people = torch.sum((prev_frame > -0.5) & (prev_frame < 0.5)).float()
         
         people_loss = torch.abs(pred_people - target_people) / (target_people + 1.0)
+        
+        # IMPORTANT: Penalize people disappearing in the middle of the room
+        # People should only decrease count when at exits (boundaries)
+        if target_people < prev_people:
+            # Find where people disappeared
+            prev_people_mask = (prev_frame > -0.5) & (prev_frame < 0.5)
+            target_people_mask = (target > -0.5) & (target < 0.5)
+            
+            # Check if disappeared people were near exits (boundaries)
+            # Create exit proximity mask (within 3 pixels of boundary)
+            batch_size, _, H, W = target.shape
+            exit_zone = torch.zeros_like(target, dtype=torch.bool)
+            exit_zone[:, :, :3, :] = True   # Top boundary
+            exit_zone[:, :, -3:, :] = True  # Bottom boundary
+            exit_zone[:, :, :, :3] = True   # Left boundary
+            exit_zone[:, :, :, -3:] = True  # Right boundary
+            
+            # Find people who disappeared
+            disappeared = prev_people_mask & (~target_people_mask)
+            
+            # Penalize if they disappeared NOT in exit zone
+            disappeared_in_middle = disappeared & (~exit_zone)
+            premature_exit_penalty = torch.sum(disappeared_in_middle).float() * 2.0
+        else:
+            premature_exit_penalty = 0.0
         
         # Encourage discrete values
         if non_wall.any():
@@ -145,7 +171,7 @@ class DirectionalLoss(nn.Module):
         else:
             discrete_loss = 0
         
-        return mse_loss + people_loss + discrete_loss
+        return mse_loss + people_loss + discrete_loss + premature_exit_penalty
 
 
 def train_model(model, train_loader, val_loader, epochs=40, device='cpu'):
@@ -234,9 +260,11 @@ def find_people_positions(frame):
     return positions
 
 
-def move_toward_exits(current_frame, distance_field, max_movement=1.5):
+def move_toward_exits(current_frame, distance_field, max_movement=1.5, min_distance=2.0):
     """
     Move people along gradient descent of distance field (toward exits)
+    with collision avoidance to prevent merging.
+    STRICT: Maintains exact people count - no creation, only removal at exits.
     """
     current_positions = find_people_positions(current_frame)
     
@@ -250,8 +278,11 @@ def move_toward_exits(current_frame, distance_field, max_movement=1.5):
     # Calculate gradient of distance field
     gy, gx = np.gradient(distance_field)
     
+    # Track which positions will be occupied to prevent overlaps
+    occupied_positions = set()
     new_positions = []
-    for x, y in current_positions:
+    
+    for i, (x, y) in enumerate(current_positions):
         # Get gradient direction (negative = toward exits)
         dx = -gx[y, x]
         dy = -gy[y, x]
@@ -262,24 +293,63 @@ def move_toward_exits(current_frame, distance_field, max_movement=1.5):
             dx = (dx / distance) * max_movement
             dy = (dy / distance) * max_movement
         
-        # Calculate new position
-        new_x = int(round(x + dx))
-        new_y = int(round(y + dy))
+        # Calculate proposed new position
+        new_x = x + dx
+        new_y = y + dy
         
-        # Bounds check
-        new_x = np.clip(new_x, 1, 48)
-        new_y = np.clip(new_y, 1, 48)
+        # Check distance to ALL other people's PROPOSED positions (not just current)
+        # This prevents multiple people from moving to overlapping locations
+        for j, (other_x, other_y) in enumerate(current_positions):
+            if i != j:
+                # Calculate where the other person will move
+                other_dx = -gx[other_y, other_x]
+                other_dy = -gy[other_y, other_x]
+                other_dist = np.sqrt(other_dx**2 + other_dy**2)
+                if other_dist > 0:
+                    other_dx = (other_dx / other_dist) * max_movement
+                    other_dy = (other_dy / other_dist) * max_movement
+                
+                other_new_x = other_x + other_dx
+                other_new_y = other_y + other_dy
+                
+                # Check if we'll be too close after both move
+                dist_to_other = np.sqrt((new_x - other_new_x)**2 + (new_y - other_new_y)**2)
+                if dist_to_other < min_distance:
+                    # Reduce movement to maintain spacing
+                    reduction_factor = 0.5
+                    dx *= reduction_factor
+                    dy *= reduction_factor
+                    new_x = x + dx
+                    new_y = y + dy
+                    break
         
-        # Check if reached exit
+        # Final position with bounds checking
+        new_x_int = int(round(new_x))
+        new_y_int = int(round(new_y))
+        new_x_int = np.clip(new_x_int, 1, 48)
+        new_y_int = np.clip(new_y_int, 1, 48)
+        
+        # Check if reached exit (at boundary with non-wall)
         at_exit = False
-        if new_x <= 1 or new_x >= 48 or new_y <= 1 or new_y >= 48:
-            if new_frame[new_y, new_x] != -1:
+        if new_x_int <= 1 or new_x_int >= 48 or new_y_int <= 1 or new_y_int >= 48:
+            if new_frame[new_y_int, new_x_int] != -1:
                 at_exit = True
         
-        if not at_exit:
-            new_positions.append((new_x, new_y))
+        if at_exit:
+            # Person exits - don't add to new positions
+            continue
+        
+        # Check if this position is already occupied
+        if (new_x_int, new_y_int) in occupied_positions:
+            # Stay in current position if new position is taken
+            if (x, y) not in occupied_positions:
+                new_positions.append((x, y))
+                occupied_positions.add((x, y))
+        else:
+            new_positions.append((new_x_int, new_y_int))
+            occupied_positions.add((new_x_int, new_y_int))
     
-    # Place people
+    # Place people at new positions (and ONLY these positions)
     for x, y in new_positions:
         if 0 < x < 49 and 0 < y < 49:
             new_frame[y, x] = 0
@@ -288,7 +358,7 @@ def move_toward_exits(current_frame, distance_field, max_movement=1.5):
 
 
 def predict_evacuation(model, initial_frame, num_steps=100, device='cpu'):
-    """Predict with exit-aware model"""
+    """Predict with exit-aware model and strict people conservation"""
     model.eval()
     
     # Create distance field
@@ -303,6 +373,8 @@ def predict_evacuation(model, initial_frame, num_steps=100, device='cpu'):
     initial_people = len(find_people_positions(initial_frame.cpu().numpy()))
     print(f"Starting evacuation with {initial_people} people")
     
+    prev_people_count = initial_people
+    
     with torch.no_grad():
         for step in range(num_steps):
             # Prepare input with distance field
@@ -316,11 +388,61 @@ def predict_evacuation(model, initial_frame, num_steps=100, device='cpu'):
             # Get prediction
             prediction = model(input_frames).squeeze().cpu().numpy()
             
-            # Use distance field to guide movement
+            # Use distance field to guide movement with collision avoidance
             current_np = current_frame.cpu().numpy()
-            new_frame = move_toward_exits(current_np, distance_field, max_movement=1.5)
+            new_frame = move_toward_exits(current_np, distance_field, 
+                                         max_movement=1.5, min_distance=2.0)
             
             people_remaining = len(find_people_positions(new_frame))
+            
+            # STRICT CONSERVATION CHECK
+            # People can only decrease (exit), never increase (creation)
+            if people_remaining > prev_people_count:
+                print(f"  ⚠ ERROR: People count increased from {prev_people_count} to {people_remaining}!")
+                print(f"     This should never happen. Reverting to previous frame.")
+                # Use previous frame instead
+                new_frame = current_frame.cpu().numpy()
+                people_remaining = prev_people_count
+            
+            # Check for premature disappearance (people vanishing in middle of room)
+            if people_remaining < prev_people_count:
+                people_lost = prev_people_count - people_remaining
+                
+                # Verify they disappeared at exits, not in the middle
+                disappeared_positions = []
+                current_pos = find_people_positions(current_np)
+                new_pos = set(find_people_positions(new_frame))
+                
+                for cx, cy in current_pos:
+                    # Check if this person still exists in new frame
+                    # Allow small movement tolerance (within 2 pixels)
+                    still_exists = any(
+                        abs(cx - nx) <= 2 and abs(cy - ny) <= 2
+                        for nx, ny in new_pos
+                    )
+                    
+                    if not still_exists:
+                        # Check if they were at an exit (within 2 pixels of boundary)
+                        at_exit = (cx <= 2 or cx >= 47 or cy <= 2 or cy >= 47)
+                        
+                        if not at_exit:
+                            print(f"  ⚠ Warning: Person at ({cx}, {cy}) disappeared mid-room (not at exit)")
+                            disappeared_positions.append((cx, cy))
+                
+                # Restore people who disappeared prematurely
+                if disappeared_positions:
+                    print(f"  ↻ Restoring {len(disappeared_positions)} people who disappeared prematurely")
+                    for x, y in disappeared_positions:
+                        new_frame[y, x] = 0
+                    people_remaining = len(find_people_positions(new_frame))
+            
+            # Final validation
+            if people_remaining > prev_people_count:
+                print(f"  ✗ CRITICAL: Still have more people! Forcing correction.")
+                new_frame = current_frame.cpu().numpy()
+                people_remaining = prev_people_count
+            
+            prev_people_count = people_remaining
             
             current_frame = torch.FloatTensor(new_frame)
             sequence.append(current_frame.clone())
@@ -391,7 +513,7 @@ def animate_evacuation(sequence, save_path='evacuation_exit_aware.gif'):
 
 
 def main():
-    data_dir = Path("..", "evacuation_data")
+    data_dir = Path("..","evacuation_data")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
