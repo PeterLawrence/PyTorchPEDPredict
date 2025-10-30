@@ -141,7 +141,7 @@ class EvacuationDataGenerator:
 
 def main():
     # Configuration
-    num_train_sequences = 50
+    num_train_sequences = 100
     num_val_sequences = 10
     output_dir = Path("evacuation_data")
     output_dir.mkdir(exist_ok=True)

@@ -4,287 +4,279 @@ Loads a trained model and generates evacuation predictions from random initial s
 """
 
 import torch
-import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from pathlib import Path
-import argparse
-import os
-from evacuation_cnn import EvacuationCNN
+from scipy.ndimage import label as connected_components
+from scipy.spatial.distance import cdist
+from evacuation_cnn import GradualMovementCNN
 
 
-def create_random_initial_scene(room_width=50, room_height=50, num_people=None,
-                                min_people=5, max_people=20):
+def move_people_gradually(current_frame, predicted_frame, wall_mask, max_movement=2.5):
     """
-    Create a random initial scene with people positioned randomly
-    
-    Args:
-        room_width: Width of the room
-        room_height: Height of the room
-        num_people: Number of people (if None, random between min and max)
-        min_people: Minimum number of people if num_people is None
-        max_people: Maximum number of people if num_people is None
+    Move people from current positions toward predicted positions, 
+    but constrain maximum movement distance
     """
-    scene = np.ones((room_height, room_width), dtype=np.float32)
+    # Find current people positions
+    current_positions = find_people_positions(current_frame)
     
-    # Add walls (boundaries)
-    scene[0, :] = -1  # Top wall
-    scene[-1, :] = -1  # Bottom wall
-    scene[:, 0] = -1  # Left wall
-    scene[:, -1] = -1  # Right wall
+    if len(current_positions) == 0:
+        return current_frame
     
-    # Add exits (gaps in walls)
-    exit_size = 3
+    # Find predicted people positions
+    predicted_positions = find_people_positions(predicted_frame)
     
-    # Left exit
-    exit_pos_left = np.random.randint(10, room_height - 10)
-    scene[exit_pos_left:exit_pos_left + exit_size, 0] = 1
+    # Start with empty frame
+    new_frame = np.ones_like(current_frame)
+    new_frame[wall_mask] = -1
     
-    # Right exit
-    exit_pos_right = np.random.randint(10, room_height - 10)
-    scene[exit_pos_right:exit_pos_right + exit_size, -1] = 1
+    if len(predicted_positions) == 0:
+        # If no predictions, keep people where they are
+        for x, y in current_positions:
+            new_frame[y, x] = 0
+        return new_frame
     
-    # Optionally add top/bottom exits
-    if np.random.random() > 0.5:
-        exit_pos_top = np.random.randint(10, room_width - 10)
-        scene[0, exit_pos_top:exit_pos_top + exit_size] = 1
-    
-    if np.random.random() > 0.5:
-        exit_pos_bottom = np.random.randint(10, room_width - 10)
-        scene[-1, exit_pos_bottom:exit_pos_bottom + exit_size] = 1
-    
-    # Determine number of people
-    if num_people is None:
-        num_people = np.random.randint(min_people, max_people + 1)
-    
-    # Add people at random positions
-    people_added = 0
-    attempts = 0
-    max_attempts = num_people * 10
-    
-    while people_added < num_people and attempts < max_attempts:
-        x = np.random.randint(3, room_width - 3)
-        y = np.random.randint(3, room_height - 3)
+    # Match each current person to nearest predicted position
+    if len(predicted_positions) > 0:
+        current_array = np.array(current_positions)
+        predicted_array = np.array(predicted_positions)
         
-        # Check if position is free (not a wall or another person)
-        if scene[y, x] == 1:
-            scene[y, x] = 0  # Place person
-            people_added += 1
+        # Calculate distances
+        distances = cdist(current_array, predicted_array)
         
-        attempts += 1
+        used_predictions = set()
+        new_positions = []
+        
+        for i, (curr_x, curr_y) in enumerate(current_positions):
+            # Find nearest predicted position that hasn't been used
+            sorted_indices = np.argsort(distances[i])
+            
+            target_found = False
+            for pred_idx in sorted_indices:
+                if pred_idx not in used_predictions:
+                    pred_x, pred_y = predicted_positions[pred_idx]
+                    used_predictions.add(pred_idx)
+                    target_found = True
+                    break
+            
+            if not target_found:
+                # No available target, try to move toward nearest exit
+                if curr_x < 25:
+                    pred_x, pred_y = max(0, curr_x - 1), curr_y
+                else:
+                    pred_x, pred_y = min(49, curr_x + 1), curr_y
+            
+            # Calculate movement vector
+            dx = pred_x - curr_x
+            dy = pred_y - curr_y
+            distance = np.sqrt(dx**2 + dy**2)
+            
+            # Constrain movement
+            if distance > max_movement:
+                dx = dx / distance * max_movement
+                dy = dy / distance * max_movement
+            
+            # Calculate new position
+            new_x = int(round(curr_x + dx))
+            new_y = int(round(curr_y + dy))
+            
+            # Keep in bounds and not on walls
+            new_x = np.clip(new_x, 1, 48)
+            new_y = np.clip(new_y, 1, 48)
+            
+            # Check if person reached exit (at boundary)
+            if new_x <= 1 or new_x >= 48 or new_y <= 1 or new_y >= 48:
+                # Check if there's an exit here
+                if new_frame[new_y, new_x] != -1:
+                    # Person exits - don't place them
+                    continue
+            
+            new_positions.append((new_x, new_y))
+        
+        # Place people at new positions
+        for x, y in new_positions:
+            if 0 < x < 49 and 0 < y < 49:
+                new_frame[y, x] = 0
     
-    print(f"Created initial scene with {people_added} people")
-    return torch.FloatTensor(scene), people_added
+    return new_frame
 
 
-def predict_evacuation(model, initial_frame, num_steps=60, device='cpu'):
+def find_people_positions(frame):
+    """Extract individual people positions from frame"""
+    people_mask = (frame > -0.5) & (frame < 0.5)
+    
+    if not people_mask.any():
+        return []
+    
+    # Use connected components
+    labeled, num_features = connected_components(people_mask)
+    
+    positions = []
+    for i in range(1, num_features + 1):
+        region = labeled == i
+        y_coords, x_coords = np.where(region)
+        if len(y_coords) > 0:
+            center_y = int(np.mean(y_coords))
+            center_x = int(np.mean(x_coords))
+            positions.append((center_x, center_y))
+    
+    return positions
+
+
+def predict_evacuation_gradual(model, initial_frame, num_steps=100, device='cpu'):
     """
-    Predict evacuation sequence from initial frame
-    
-    Args:
-        model: Trained EvacuationCNN model
-        initial_frame: Initial room configuration (torch.Tensor)
-        num_steps: Maximum number of prediction steps
-        device: Device to run predictions on
-    
-    Returns:
-        List of predicted frames as numpy arrays
+    Predict evacuation with gradual, constrained movement
     """
     model.eval()
     
-    # Initialize with copies of the initial frame
-    sequence = [initial_frame.clone() for _ in range(5)]
+    # Initialize
+    current_frame = initial_frame.clone()
+    sequence = [current_frame.clone() for _ in range(2)]
     predicted_sequence = [initial_frame.cpu().numpy()]
     
-    print("Predicting evacuation...")
+    wall_mask = initial_frame.cpu().numpy() < -0.5
+    
+    initial_people = len(find_people_positions(initial_frame.cpu().numpy()))
+    print(f"Starting evacuation with {initial_people} people")
+    
+    consecutive_no_change = 0
+    prev_people_count = initial_people
+    
     with torch.no_grad():
         for step in range(num_steps):
-            # Prepare input (last 5 frames)
-            input_frames = torch.stack(sequence[-5:]).unsqueeze(0).unsqueeze(2)  # (1, 5, 1, H, W)
+            # Prepare input
+            input_frames = torch.stack(sequence[-2:]).unsqueeze(0).unsqueeze(2)
             input_frames = input_frames.to(device)
             
-            # Predict next frame
-            next_frame = model(input_frames)
-            next_frame = next_frame.squeeze()
+            # Predict
+            prediction = model(input_frames).squeeze().cpu().numpy()
             
-            # Convert to numpy for processing
-            next_frame_np = next_frame.cpu().numpy()
+            # Apply gradual movement constraint
+            current_np = current_frame.cpu().numpy()
+            new_frame = move_people_gradually(current_np, prediction, wall_mask, max_movement=2.5)
             
-            # Preserve walls (-1)
-            wall_mask = (sequence[-1].cpu().numpy() < -0.5)
-            next_frame_np[wall_mask] = -1
+            # Count people
+            people_remaining = len(find_people_positions(new_frame))
             
-            # Count remaining people (values close to 0)
-            people_remaining = np.sum((next_frame_np > -0.5) & (next_frame_np < 0.5))
+            # Check for stagnation
+            if people_remaining == prev_people_count:
+                consecutive_no_change += 1
+            else:
+                consecutive_no_change = 0
+            
+            prev_people_count = people_remaining
             
             # Add to sequence
-            sequence.append(torch.FloatTensor(next_frame_np))
-            predicted_sequence.append(next_frame_np)
+            current_frame = torch.FloatTensor(new_frame)
+            sequence.append(current_frame.clone())
+            predicted_sequence.append(new_frame)
             
-            # Check if evacuation is complete
-            if people_remaining < 1:
+            if people_remaining == 0:
                 print(f"✓ Evacuation complete at step {step + 1}")
                 break
             
+            # Detect if stuck
+            if consecutive_no_change > 15:
+                print(f"⚠ Evacuation appears stuck at step {step + 1} with {people_remaining} people remaining")
+                break
+            
             if (step + 1) % 10 == 0:
-                print(f"  Step {step + 1}/{num_steps} - {people_remaining:.0f} people remaining")
+                print(f"  Step {step + 1}/{num_steps} - {people_remaining} people remaining")
     
     return predicted_sequence
 
 
-def animate_evacuation(sequence, save_path='evacuation_prediction.gif', fps=5, dpi=100):
-    """
-    Create and save animation of evacuation
+def create_initial_scene(room_width=50, room_height=50, num_people=10):
+    """Create initial scene with well-spaced people"""
+    scene = np.ones((room_height, room_width), dtype=np.float32)
     
-    Args:
-        sequence: List of frames (numpy arrays)
-        save_path: Path to save the GIF
-        fps: Frames per second
-        dpi: DPI for the output
-    """
-    print(f"\nCreating animation with {len(sequence)} frames...")
+    # Walls
+    scene[0, :] = -1
+    scene[-1, :] = -1
+    scene[:, 0] = -1
+    scene[:, -1] = -1
     
+    # Exits
+    exit_size = 5
+    exit_left = room_height // 2 - 2
+    scene[exit_left:exit_left + exit_size, 0] = 1
+    
+    exit_right = room_height // 2 - 2
+    scene[exit_right:exit_right + exit_size, -1] = 1
+    
+    # Place people with spacing
+    people_positions = []
+    min_distance = 4
+    attempts = 0
+    
+    while len(people_positions) < num_people and attempts < num_people * 200:
+        x = np.random.randint(8, room_width - 8)
+        y = np.random.randint(8, room_height - 8)
+        
+        # Check spacing
+        too_close = any(np.sqrt((x - px)**2 + (y - py)**2) < min_distance 
+                       for px, py in people_positions)
+        
+        if not too_close:
+            scene[y, x] = 0
+            people_positions.append((x, y))
+        
+        attempts += 1
+    
+    print(f"Created scene with {len(people_positions)} people")
+    return torch.FloatTensor(scene)
+
+
+def animate_evacuation(sequence, save_path=None):
+    """Create animation"""
     fig, ax = plt.subplots(figsize=(8, 8))
     
-    # Display first frame
     img = ax.imshow(sequence[0], cmap='gray', vmin=-1, vmax=1, interpolation='nearest')
-    ax.set_title(f'Evacuation Prediction - Frame 1/{len(sequence)}')
+    ax.set_title(f'Gradual Movement Prediction - Frame 1/{len(sequence)}')
     ax.axis('off')
     
-    # Add colorbar legend
     cbar = plt.colorbar(img, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label('Walls (-1) | People (0) | Empty (1)', rotation=270, labelpad=20)
     
     def update(frame_idx):
         img.set_array(sequence[frame_idx])
-        ax.set_title(f'Evacuation Prediction - Frame {frame_idx+1}/{len(sequence)}')
+        people_count = np.sum((sequence[frame_idx] > -0.5) & (sequence[frame_idx] < 0.5))
+        ax.set_title(f'Gradual Movement Prediction - Frame {frame_idx+1}/{len(sequence)}\n'
+                    f'People: {int(people_count)}')
         return [img]
     
-    # Create animation
     anim = animation.FuncAnimation(fig, update, frames=len(sequence), 
-                                   interval=1000//fps, blit=True, repeat=True)
+                                   interval=200, blit=True, repeat=True)
     
-    # Save as GIF
-    print(f"Saving animation to {save_path}...")
-    anim.save(save_path, writer='pillow', fps=fps, dpi=dpi)
-    print(f"✓ Animation saved successfully!")
+    if save_path:
+        anim.save(save_path, writer='pillow', fps=5)
+        print(f"Animation saved to {save_path}")
     
-    plt.close()
-
-
-def visualize_initial_and_final(initial_frame, final_frame, save_path='comparison.png'):
-    """Create a side-by-side comparison of initial and final frames"""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-    
-    ax1.imshow(initial_frame, cmap='gray', vmin=-1, vmax=1, interpolation='nearest')
-    ax1.set_title('Initial Scene')
-    ax1.axis('off')
-    
-    ax2.imshow(final_frame, cmap='gray', vmin=-1, vmax=1, interpolation='nearest')
-    ax2.set_title('Final Scene (Evacuated)')
-    ax2.axis('off')
-    
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f"Comparison image saved to {save_path}")
-    plt.close()
+    plt.show()
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Predict evacuation from a trained model')
-    parser.add_argument('--model-dir', type=str, default='model_data',
-                        help='Directory model data')
-    parser.add_argument('--model', type=str, default='evacuation_model.pt',
-                        help='Path to trained model file')
-    parser.add_argument('--output-dir', type=str, default='visualizations',
-                        help='Directory to save visualizations')
-    parser.add_argument('--output', type=str, default='evacuation_prediction.gif',
-                        help='Output GIF filename')
-    parser.add_argument('--num-people', type=int, default=None,
-                        help='Number of people (random if not specified)')
-    parser.add_argument('--min-people', type=int, default=8,
-                        help='Minimum number of people if random')
-    parser.add_argument('--max-people', type=int, default=25,
-                        help='Maximum number of people if random')
-    parser.add_argument('--steps', type=int, default=80,
-                        help='Maximum prediction steps')
-    parser.add_argument('--fps', type=int, default=5,
-                        help='Frames per second for output GIF')
-    parser.add_argument('--seed', type=int, default=None,
-                        help='Random seed for reproducibility')
-    
-    args = parser.parse_args()
-    
-    # Set random seed if specified
-    if args.seed is not None:
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
-        print(f"Random seed set to {args.seed}")
-    
-    # Setup device
+    # Configuration
+    data_dir = Path("evacuation_data")
+    model_dir = Path("model_data")
+    model_path = Path(model_dir,"evacuation_model.pt")
+    visualizations_path = Path('visualizations','evacuation_animation.gif')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}\n")
-    
-    # Load model
-    model_path = Path(args.model_dir,args.model)
-    if not model_path.exists():
-        print(f"Error: Model file '{model_path}' not found!")
-        print("Please train the model first using train_and_predict.py")
-        return
+    print(f"Using device: {device}")
 
-    output_results = Path(args.output_dir,args.output)
-    
-    print(f"Loading model from {model_path}...")
+    model = GradualMovementCNN(input_frames=2).to(device)
+    print("\nLoading model...")
     checkpoint = torch.load(model_path, map_location=device)
-    
-    model = EvacuationCNN(input_frames=5).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
-    print("✓ Model loaded successfully\n")
     
-    # Create random initial scene
-    print("Generating random initial scene...")
-    initial_scene, num_people = create_random_initial_scene(
-        num_people=args.num_people,
-        min_people=args.min_people,
-        max_people=args.max_people
-    )
-    print()
+    print("\nGenerating prediction...")
+    initial_scene = create_initial_scene(num_people=10)
+    predicted_sequence = predict_evacuation_gradual(model, initial_scene, 
+                                                    num_steps=100, device=device)
     
-    # Predict evacuation
-    predicted_sequence = predict_evacuation(
-        model, 
-        initial_scene, 
-        num_steps=args.steps, 
-        device=device
-    )
-    
-    # Create and save animation
-    animate_evacuation(
-        predicted_sequence, 
-        save_path=output_results,
-        fps=args.fps
-    )
-    
-    # Create comparison image
-    comparison_path = args.output.replace('.gif', '_comparison.png')
-    comparison_path = Path(args.output_dir,comparison_path)
-    visualize_initial_and_final(
-        predicted_sequence[0],
-        predicted_sequence[-1],
-        save_path=comparison_path
-    )
-    
-    # Summary
-    print("\n" + "="*50)
-    print("PREDICTION SUMMARY")
-    print("="*50)
-    print(f"Initial people: {num_people}")
-    print(f"Total frames: {len(predicted_sequence)}")
-    print(f"Animation saved: {args.output}")
-    print(f"Comparison saved: {comparison_path}")
-    print("="*50)
+    print(f"\nGenerated {len(predicted_sequence)} frames")
+    animate_evacuation(predicted_sequence, save_path=visualizations_path)
 
 
 if __name__ == "__main__":

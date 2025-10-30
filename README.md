@@ -1,6 +1,6 @@
 # PyTorch PED Predict
 
-Experimental code related to predicting bitmap outline evacuations 
+Experimental code related to predicting bitmap coarse representation evacuations 
 
 ### generate_training_data.py
 
@@ -10,13 +10,11 @@ Experimental code related to predicting bitmap outline evacuations
 - Saves data as PyTorch .pt files in evacuation_data/ directory
 - Encoding: -1 = wall, 0 = person (black pixel), 1 = empty space (white)
 
-### train_and_predict.py
+### train_evacuation.py
 
 - Loads the training data from .pt files
 - Creates a CNN with temporal and spatial convolutions using conv2d
 - Trains the model to predict the next frame given the previous 5 frames
-- After training, generates a prediction from an initial scene
-- Creates an animated GIF showing the evacuation
 
 ### predict_evacuation.py
 
@@ -32,3 +30,13 @@ Experimental code related to predicting bitmap outline evacuations
 - Creates animated GIFs of individual evacuation sequences
 - Generates grid visualization showing initial/final frames
 - Creates statistical plots analyzing the training data
+
+### evacuation_cnn.py
+- CNN data classes
+- GradualMovementCNN  CNN focused on learning small, incremental movements
+- MovementConstrainedLoss loss that penalizes large movements between frames
+
+### TestModel Directory
+- A number of development models
+- Version implemented in main folder evacuation_predict_constrain_step4.py
+- Model ending in step_8 is the most complex but also the most constrained model
